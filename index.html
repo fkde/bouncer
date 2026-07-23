@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bouncer · Image Safety Gate</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo">◑</div>
+        <div>
+          <h1>Bouncer</h1>
+          <span class="subtitle">Image Safety Gate</span>
+        </div>
+      </div>
+      <nav class="tabs">
+        <button class="tab active" data-tab="classify">Classify</button>
+        <button class="tab" data-tab="settings">Settings</button>
+      </nav>
+      <div class="status" id="connStatus">
+        <span class="dot" id="connDot"></span>
+        <span id="connText">Connecting…</span>
+      </div>
+    </header>
+
+    <!-- CLASSIFY TAB -->
+    <main class="panel active" id="tab-classify">
+      <section class="dropzone" id="dropzone">
+        <input type="file" id="fileInput" accept="image/*" multiple hidden />
+        <div class="dropzone-inner">
+          <div class="drop-icon">⬆</div>
+          <p><strong>Drag images here</strong> or click to browse</p>
+          <span class="hint">PNG, JPG, WebP · multiple images supported</span>
+        </div>
+      </section>
+
+      <div class="toolbar">
+        <button class="btn primary" id="runBtn" disabled>Analyze</button>
+        <button class="btn ghost" id="clearBtn" disabled>Clear</button>
+        <span class="model-chip" id="modelChip">no model</span>
+      </div>
+
+      <section class="results" id="results"></section>
+    </main>
+
+    <!-- SETTINGS TAB -->
+    <main class="panel" id="tab-settings">
+      <div class="settings-grid">
+        <div class="field">
+          <label for="apiBase">Classifier API base</label>
+          <div class="row">
+            <input type="text" id="apiBase" placeholder="(blank = this server)" />
+            <button class="btn ghost" id="refreshBtn">↻ Reload models</button>
+          </div>
+          <span class="field-hint">Leave blank to use the server that served this page. Set e.g. <code>https://classifier.example.com</code> to drive a remote container.</span>
+        </div>
+
+        <div class="field">
+          <label for="describerSelect">Stage 1 · Describer model (vision)</label>
+          <select id="describerSelect"><option>—</option></select>
+          <span class="field-hint">Only describes the image — must support vision. E.g. <code>gemma4:e2b</code>, <code>llava</code>, <code>qwen2.5vl</code>. Pull more via <code>docker compose exec ollama pull-model.sh &lt;tag&gt;</code>.</span>
+        </div>
+
+        <div class="field">
+          <label for="decisionSelect">Stage 2 · Decision model (text)</label>
+          <select id="decisionSelect"><option>—</option></select>
+          <span class="field-hint">Decides from the description (text only). Same tag as the describer = one model loaded = fastest on CPU.</span>
+        </div>
+
+        <div class="field">
+          <label for="threshold">Uncertainty threshold <span id="thrVal" class="pill">0.80</span></label>
+          <input type="range" id="threshold" min="0.5" max="1" step="0.05" value="0.8" />
+          <span class="field-hint">Below this confidence, the result is flagged as <b>Uncertain</b> instead of allowed/rejected.</span>
+        </div>
+
+        <div class="field">
+          <label for="temperature">Temperature <span id="tempVal" class="pill">0.0</span></label>
+          <input type="range" id="temperature" min="0" max="1" step="0.1" value="0" />
+          <span class="field-hint">Used for both stages. Lower = more deterministic.</span>
+        </div>
+
+        <div class="field span-2">
+          <label for="describerPrompt">
+            Stage 1 prompt · image description (vision model)
+            <button class="btn ghost tiny" id="resetDescriberBtn" type="button">↺ Reload from file</button>
+          </label>
+          <textarea id="describerPrompt" rows="10"></textarea>
+          <span class="field-hint">Loaded from <code>prompts/describer.txt</code>. Edit that file to change it permanently; edits here are session-only.</span>
+        </div>
+
+        <div class="field span-2">
+          <label for="systemPrompt">
+            Stage 2 prompt · decision rules (text model)
+            <button class="btn ghost tiny" id="resetPromptBtn" type="button">↺ Reload from file</button>
+          </label>
+          <textarea id="systemPrompt" rows="18"></textarea>
+          <span class="field-hint">Loaded from <code>prompts/decision.txt</code>. Edit that file to change it permanently; edits here are session-only.</span>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

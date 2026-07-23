@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+classifier/node_modules/
+
+# Local env / secrets (commit .env.example instead)
+.env
+.env.local
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Runtime / temp
+scratchpad/
+tmp/

@@ -1,0 +1,37 @@
+# Pin the project name so container/command names don't depend on the folder.
+name: bouncer
+
+services:
+  # One self-contained container: Ollama + the Bouncer API + demo UI.
+  bouncer:
+    build: .
+    image: bouncer
+    container_name: bouncer
+    environment:
+      # Ollama tags, pulled automatically at boot. Pull more later with:
+      #   docker compose exec bouncer pull-model.sh <tag>
+      DESCRIBER_MODEL: ${DESCRIBER_MODEL:-gemma4:e2b} # stage 1 — MUST support vision
+      DECISION_MODEL: ${DECISION_MODEL:-gemma4:e2b}   # stage 2 — text only is fine
+      # EXTRA_MODELS: "gemma4:e4b"                     # optional, pre-pull for comparison
+      THRESHOLD: ${THRESHOLD:-0.8}
+      TEMPERATURE: ${TEMPERATURE:-0}
+      MAX_DIM: ${MAX_DIM:-1536}
+      PORT: 8080
+      # Where Ollama runs. Default = inside this container (CPU).
+      # Apple Silicon GPU: run Ollama natively on the Mac and set (in .env)
+      #   OLLAMA_URL=http://host.docker.internal:11434
+      # The entrypoint then auto-detects the external host and skips the local Ollama.
+      OLLAMA_URL: ${OLLAMA_URL:-http://127.0.0.1:11434}
+    volumes:
+      - ollama-models:/root/.ollama # persist downloaded models across restarts
+      # Live-editable at runtime (source of truth for prompts + UI):
+      - ./prompts:/app/prompts:ro
+      - ./index.html:/app/public/index.html:ro
+      - ./styles.css:/app/public/styles.css:ro
+      - ./app.js:/app/public/app.js:ro
+    ports:
+      - "${BOUNCER_PORT:-8080}:8080"
+    restart: unless-stopped
+
+volumes:
+  ollama-models:
