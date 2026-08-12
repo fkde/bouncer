@@ -31,8 +31,17 @@ has_model() {
   ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$1"
 }
 
+# "gemma4" -> "gemma4:latest". Ollama always reports tags fully qualified, so an
+# unqualified name would never match and we'd re-pull on every single boot.
+norm_tag() {
+  case "$1" in
+    *:*) printf '%s' "$1" ;;
+    *) printf '%s:latest' "$1" ;;
+  esac
+}
+
 pull_one() {
-  id="$1"
+  id="$(norm_tag "$1")"
   [ -n "$id" ] || return 0
   if has_model "$id"; then
     log "already present: $id"

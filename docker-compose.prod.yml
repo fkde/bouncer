@@ -1,0 +1,46 @@
+# Run the PUBLISHED image (from Docker Hub) — no build, no bind mounts.
+# For deploying on a server:
+#
+#   IMAGE=fkde/bouncer:latest docker compose -f docker-compose.prod.yml up -d
+#   # or simply: make prod TAG=latest
+#
+# The app (UI + prompts) is baked into the image, so nothing from this repo is
+# needed at runtime — only this file and your .env.
+#
+# NVIDIA GPU: add `-f docker-compose.gpu.yml` (or use `make prod-gpu`).
+name: bouncer
+
+services:
+  bouncer:
+    image: ${IMAGE:-fkde/bouncer:latest}
+    container_name: bouncer
+    init: true
+    environment:
+      DESCRIBER_MODEL: ${DESCRIBER_MODEL:-gemma4:e2b}
+      DECISION_MODEL: ${DECISION_MODEL:-gemma4:e2b}
+      EXTRA_MODELS: ${EXTRA_MODELS:-}
+      THRESHOLD: ${THRESHOLD:-0.8}
+      TEMPERATURE: ${TEMPERATURE:-0}
+      MAX_DIM: ${MAX_DIM:-1536}
+      PORT: 8080
+      OLLAMA_URL: ${OLLAMA_URL:-http://127.0.0.1:11434}
+      CLASSIFY_CONCURRENCY: ${CLASSIFY_CONCURRENCY:-1}
+      QUEUE_MAX: ${QUEUE_MAX:-32}
+      QUEUE_WAIT_MS: ${QUEUE_WAIT_MS:-60000}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-26214400}
+      REQUEST_TIMEOUT_MS: ${REQUEST_TIMEOUT_MS:-180000}
+      # Production posture: token required, no caller-supplied models/prompts,
+      # demo UI off. Generate a token with `make token`.
+      API_TOKEN: ${API_TOKEN:?set API_TOKEN in .env — run "make token"}
+      ALLOW_OVERRIDES: ${ALLOW_OVERRIDES:-false}
+      SERVE_UI: ${SERVE_UI:-false}
+    volumes:
+      - ollama-models:/root/.ollama # persist pulled models
+      # To customise prompts without rebuilding, uncomment:
+      # - ./prompts:/app/prompts:ro
+    ports:
+      - "${BOUNCER_PORT:-8080}:8080"
+    restart: unless-stopped
+
+volumes:
+  ollama-models:

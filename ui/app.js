@@ -9,6 +9,7 @@
 
 const LS = {
   apiBase: "ic.apiBase",
+  apiToken: "ic.apiToken",
   describerModel: "ic.describerModel",
   decisionModel: "ic.decisionModel",
   temp: "ic.temp",
@@ -32,6 +33,8 @@ const els = {
   results: $("results"),
   modelChip: $("modelChip"),
   apiBase: $("apiBase"),
+  apiToken: $("apiToken"),
+  overridesNotice: $("overridesNotice"),
   describerSelect: $("describerSelect"),
   decisionSelect: $("decisionSelect"),
   threshold: $("threshold"),
@@ -48,8 +51,25 @@ const els = {
 };
 
 // Base URL of the classifier API ("" = same origin as this page).
+// Anything that isn't an absolute http(s) URL is ignored rather than prefixed onto
+// every request — browsers like to autofill this field, and a stray value here
+// would break every call with a confusing "no connection".
 function apiBase() {
-  return (els.apiBase.value || "").trim().replace(/\/+$/, "");
+  const raw = (els.apiBase.value || "").trim();
+  if (!raw) return "";
+  if (!/^https?:\/\//i.test(raw)) {
+    console.warn("Ignoring 'Classifier API base' — not an absolute http(s) URL:", raw);
+    return "";
+  }
+  return raw.replace(/\/+$/, "");
+}
+
+// Every call goes through here so the token (if any) is always attached.
+function api(pathname, init = {}) {
+  const token = (els.apiToken.value || "").trim();
+  const headers = { ...(init.headers || {}) };
+  if (token) headers.Authorization = "Bearer " + token;
+  return fetch(apiBase() + pathname, { ...init, headers });
 }
 
 // ---- Tabs ----
@@ -69,7 +89,11 @@ document.querySelectorAll(".tab").forEach((tab) => {
 
 // ---- Settings persistence (models/threshold/temp/tab/apiBase — NOT prompts) ----
 function loadSettings() {
-  els.apiBase.value = localStorage.getItem(LS.apiBase) || "";
+  const savedBase = localStorage.getItem(LS.apiBase) || "";
+  // Drop junk a browser autofill may have persisted here in an earlier session.
+  els.apiBase.value = /^https?:\/\//i.test(savedBase) ? savedBase : "";
+  if (savedBase && !els.apiBase.value) localStorage.removeItem(LS.apiBase);
+  els.apiToken.value = localStorage.getItem(LS.apiToken) || "";
   els.temperature.value = localStorage.getItem(LS.temp) || "0";
   els.tempVal.textContent = Number(els.temperature.value).toFixed(1);
   els.threshold.value = localStorage.getItem(LS.threshold) || "0.8";
@@ -77,6 +101,7 @@ function loadSettings() {
 }
 function saveSettings() {
   localStorage.setItem(LS.apiBase, els.apiBase.value.trim());
+  localStorage.setItem(LS.apiToken, els.apiToken.value.trim());
   localStorage.setItem(LS.temp, els.temperature.value);
   localStorage.setItem(LS.threshold, els.threshold.value);
   if (validSel(els.describerSelect.value)) localStorage.setItem(LS.describerModel, els.describerSelect.value);
@@ -87,9 +112,12 @@ function saveSettings() {
 // the files in prompts/ remain the source of truth (edit them + "Reload").
 async function loadConfig() {
   try {
-    const res = await fetch(apiBase() + "/api/config", { cache: "no-store" });
+    const res = await api("/api/config", { cache: "no-store" });
     if (!res.ok) throw new Error("HTTP " + res.status);
     const cfg = await res.json();
+    // When the server ignores per-request overrides, say so instead of letting the
+    // settings below look effective.
+    els.overridesNotice.style.display = cfg.overridesAllowed === false ? "" : "none";
     if (cfg.prompts) {
       els.describerPrompt.value = cfg.prompts.describer || "";
       els.systemPrompt.value = cfg.prompts.decision || "";
@@ -104,11 +132,13 @@ async function loadConfig() {
   }
 }
 
-els.apiBase.addEventListener("change", () => {
+const reconnect = () => {
   saveSettings();
   loadConfig();
   refreshModels();
-});
+};
+els.apiBase.addEventListener("change", reconnect);
+els.apiToken.addEventListener("change", reconnect);
 els.describerSelect.addEventListener("change", () => { saveSettings(); updateModelChip(); updateRunBtn(); });
 els.decisionSelect.addEventListener("change", () => { saveSettings(); updateModelChip(); updateRunBtn(); });
 els.temperature.addEventListener("input", () => {
@@ -145,7 +175,8 @@ async function refreshModels() {
   els.describerSelect.innerHTML = "<option>— loading… —</option>";
   els.decisionSelect.innerHTML = "<option>— loading… —</option>";
   try {
-    const res = await fetch(apiBase() + "/api/models");
+    const res = await api("/api/models");
+    if (res.status === 401) throw new Error("401 — set the API token in Settings");
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     const all = (data.models || []).map((m) => m.name);
@@ -172,7 +203,7 @@ async function refreshModels() {
   } catch (err) {
     els.describerSelect.innerHTML = "<option>— not connected —</option>";
     els.decisionSelect.innerHTML = "<option>— not connected —</option>";
-    setStatus("bad", "No connection to classifier");
+    setStatus("bad", String(err.message || err).startsWith("401") ? "Unauthorized — check the API token" : "No connection to classifier");
     updateModelChip();
     updateRunBtn();
     console.error(err);
@@ -368,7 +399,7 @@ function applyCardState(img, opts) {
 async function classifyOne(img, cfg) {
   try {
     setCardState(img, { kind: "pending", loading: true, label: "Analyzing…" });
-    const res = await fetch(apiBase() + "/classify", {
+    const res = await api("/classify", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

@@ -49,19 +49,32 @@
     <!-- SETTINGS TAB -->
     <main class="panel" id="tab-settings">
       <div class="settings-grid">
+        <div class="field span-2" id="overridesNotice" style="display:none">
+          <span class="field-hint">⚠ This server runs with <code>ALLOW_OVERRIDES=false</code>. The model, threshold, temperature and prompt settings below are <b>ignored</b> — every request uses the server's own configuration. That is the correct setting for a production gate.</span>
+        </div>
         <div class="field">
           <label for="apiBase">Classifier API base</label>
           <div class="row">
-            <input type="text" id="apiBase" placeholder="(blank = this server)" />
+            <input type="url" id="apiBase" name="apiBase" placeholder="(blank = this server)"
+                   autocomplete="off" data-1p-ignore data-lpignore="true" />
             <button class="btn ghost" id="refreshBtn">↻ Reload models</button>
           </div>
           <span class="field-hint">Leave blank to use the server that served this page. Set e.g. <code>https://classifier.example.com</code> to drive a remote container.</span>
         </div>
 
         <div class="field">
+          <label for="apiToken">API token</label>
+          <!-- new-password (not "off") — browsers ignore "off" on password fields and
+               would otherwise treat the field above as a username and autofill it. -->
+          <input type="password" id="apiToken" name="apiToken" placeholder="(blank = server runs without a token)"
+                 autocomplete="new-password" data-1p-ignore data-lpignore="true" />
+          <span class="field-hint">Required when the server is started with <code>API_TOKEN</code>. Sent as <code>Authorization: Bearer …</code> and kept in this browser only.</span>
+        </div>
+
+        <div class="field">
           <label for="describerSelect">Stage 1 · Describer model (vision)</label>
           <select id="describerSelect"><option>—</option></select>
-          <span class="field-hint">Only describes the image — must support vision. E.g. <code>gemma4:e2b</code>, <code>llava</code>, <code>qwen2.5vl</code>. Pull more via <code>docker compose exec ollama pull-model.sh &lt;tag&gt;</code>.</span>
+          <span class="field-hint">Only describes the image — must support vision. E.g. <code>gemma4:e2b</code>, <code>llava</code>, <code>qwen2.5vl</code>. Pull more via <code>make pull MODEL=&lt;tag&gt;</code>.</span>
         </div>
 
         <div class="field">

@@ -1,0 +1,17 @@
+# NVIDIA overlay for docker-compose.prod.yml. Needs the host's
+# nvidia-container-toolkit AND the GPU image (built by `make release-gpu`).
+#
+#   IMAGE=fkde/bouncer:latest-gpu \
+#     docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up -d
+#   # or: make prod-gpu TAG=latest
+name: bouncer
+
+services:
+  bouncer:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

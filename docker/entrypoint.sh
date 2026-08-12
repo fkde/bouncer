@@ -69,6 +69,18 @@ log "starting Bouncer on :${PORT:-8080}"
 node /app/server.js &
 NODE_PID=$!
 
+# --- Graceful shutdown: forward SIGTERM/SIGINT to the children ---
+# Without this, `docker stop` kills PID 1 only, and Docker hard-kills the rest
+# after 10s — possibly mid-pull or mid-classification.
+shutdown() {
+  log "signal received — stopping children"
+  [ -n "$OLLAMA_PID" ] && kill -TERM "$OLLAMA_PID" 2>/dev/null
+  kill -TERM "$NODE_PID" 2>/dev/null
+  wait
+  exit 0
+}
+trap shutdown TERM INT
+
 # --- Babysit: if a managed process dies, stop the container ---
 if [ -n "$OLLAMA_PID" ]; then
   wait -n "$OLLAMA_PID" "$NODE_PID"
@@ -77,6 +89,6 @@ else
 fi
 EXIT=$?
 log "a managed process exited (code $EXIT) — stopping container"
-[ -n "$OLLAMA_PID" ] && kill "$OLLAMA_PID" 2>/dev/null
-kill "$NODE_PID" 2>/dev/null
+[ -n "$OLLAMA_PID" ] && kill -TERM "$OLLAMA_PID" 2>/dev/null
+kill -TERM "$NODE_PID" 2>/dev/null
 exit "$EXIT"

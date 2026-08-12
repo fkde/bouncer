@@ -13,6 +13,7 @@
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
+const crypto = require("crypto");
 const express = require("express");
 const multer = require("multer");
 const sharp = require("sharp");
@@ -29,16 +30,39 @@ function num(v, dflt) {
   const n = Number(v);
   return Number.isFinite(n) ? n : dflt;
 }
+function flag(v, dflt) {
+  if (v == null || v === "") return dflt;
+  return /^(1|true|yes|on)$/i.test(String(v));
+}
+// Ollama reports tags fully qualified ("gemma4:e2b", "llava:latest"). Normalising
+// here keeps the readiness check from comparing "gemma4" against "gemma4:latest"
+// and reporting the model as missing forever.
+function normTag(t) {
+  const s = String(t || "").trim();
+  return s && !s.includes(":") ? s + ":latest" : s;
+}
 
 // How many images to classify at once (CPU inference is the bottleneck, so 1 =
 // serialize = predictable latency). QUEUE_MAX caps how many may wait before we
 // shed load with 503 (fail-closed backpressure).
 const CLASSIFY_CONCURRENCY = Math.max(1, num(process.env.CLASSIFY_CONCURRENCY, 1));
 const QUEUE_MAX = Math.max(1, num(process.env.QUEUE_MAX, 32));
+// Hard cap on time spent WAITING in the queue. Without it, QUEUE_MAX serial jobs
+// × two model calls each can leave the last caller hanging for hours.
+const QUEUE_WAIT_MS = Math.max(1000, num(process.env.QUEUE_WAIT_MS, 60000));
+
+// Shared-secret auth. Empty = open (dev default). Generate one with `make token`.
+const API_TOKEN = process.env.API_TOKEN || "";
+// Per-request model/prompt/threshold overrides. These can DISABLE the safety gate
+// (a caller could pass "always allow" as the decision prompt), so they are off by
+// default and only enabled for the demo UI / local development.
+const ALLOW_OVERRIDES = flag(process.env.ALLOW_OVERRIDES, false);
+// The bundled demo UI is a convenience, not a production feature.
+const SERVE_UI = flag(process.env.SERVE_UI, true);
 
 const DEFAULTS = {
-  describer: process.env.DESCRIBER_MODEL || "",
-  decision: process.env.DECISION_MODEL || "",
+  describer: normTag(process.env.DESCRIBER_MODEL),
+  decision: normTag(process.env.DECISION_MODEL),
   threshold: num(process.env.THRESHOLD, 0.8),
   temperature: num(process.env.TEMPERATURE, 0),
   maxDim: num(process.env.MAX_DIM, 1536),
@@ -289,9 +313,14 @@ function queueStats() {
   return { active: queue.active, waiting: queue.waiting.length, concurrency: CLASSIFY_CONCURRENCY, max: QUEUE_MAX };
 }
 
+function busy(msg) {
+  return Object.assign(new Error(msg), { code: "BUSY" });
+}
+
 function pump() {
   while (queue.active < CLASSIFY_CONCURRENCY && queue.waiting.length) {
     const job = queue.waiting.shift();
+    clearTimeout(job.timer); // waiting is over — the wait deadline no longer applies
     queue.active++;
     Promise.resolve()
       .then(job.run)
@@ -303,15 +332,35 @@ function pump() {
   }
 }
 
-// Enqueue work; returns a promise for its result, or rejects with BUSY if full.
+// Drop a job that has not started yet. Returns false once it is running — at that
+// point the model call is already in flight and cancelling would waste the work.
+function drop(job, err) {
+  const i = queue.waiting.indexOf(job);
+  if (i < 0) return false;
+  queue.waiting.splice(i, 1);
+  clearTimeout(job.timer);
+  job.reject(err);
+  return true;
+}
+
+// Enqueue work. Returns { promise, cancel } — `cancel` lets the caller give up
+// its slot (e.g. the client disconnected) instead of occupying the queue.
 function enqueue(run) {
   if (queue.active + queue.waiting.length >= QUEUE_MAX) {
-    return Promise.reject(Object.assign(new Error("Classifier queue is full — retry shortly."), { code: "BUSY" }));
+    return { promise: Promise.reject(busy("Classifier queue is full — retry shortly.")), cancel: () => {} };
   }
-  return new Promise((resolve, reject) => {
-    queue.waiting.push({ run, resolve, reject });
+  const job = { run, resolve: null, reject: null, timer: null };
+  const promise = new Promise((resolve, reject) => {
+    job.resolve = resolve;
+    job.reject = reject;
+    job.timer = setTimeout(
+      () => drop(job, busy(`Waited longer than ${QUEUE_WAIT_MS / 1000}s in the classifier queue — retry shortly.`)),
+      QUEUE_WAIT_MS
+    );
+    queue.waiting.push(job);
     pump();
   });
+  return { promise, cancel: (err) => drop(job, err) };
 }
 
 // ---- HTTP ----
@@ -326,9 +375,46 @@ const upload = multer({
     destination: UPLOAD_DIR,
     filename: (_req, _file, cb) => cb(null, "up_" + Date.now() + "_" + Math.random().toString(36).slice(2)),
   }),
-  limits: { fileSize: MAX_UPLOAD_BYTES },
+  limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 },
 });
-const jsonBody = express.json({ limit: "30mb" });
+// Base64 inflates by ~33%, so the JSON body limit has to sit ABOVE the raw upload
+// cap — otherwise an image that is fine as multipart is rejected as JSON.
+const jsonBody = express.json({ limit: Math.ceil(MAX_UPLOAD_BYTES * 1.4) });
+
+// Sweep leftovers from crashes or aborted uploads; the happy path unlinks itself.
+function sweepUploads() {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  fs.readdir(UPLOAD_DIR, (err, names) => {
+    if (err) return;
+    for (const name of names) {
+      const p = path.join(UPLOAD_DIR, name);
+      fs.stat(p, (e, st) => {
+        if (!e && st.mtimeMs < cutoff) fs.unlink(p, () => {});
+      });
+    }
+  });
+}
+sweepUploads();
+setInterval(sweepUploads, 60 * 60 * 1000).unref();
+
+// Shared-secret auth for everything except /healthz (orchestrators need that open).
+// Accepts `Authorization: Bearer <token>` or `X-API-Token: <token>`.
+function timingSafeEqual(a, b) {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+function requireToken(req, res, next) {
+  if (!API_TOKEN) return next();
+  const header = req.get("authorization") || "";
+  const given = header.startsWith("Bearer ") ? header.slice(7) : req.get("x-api-token") || "";
+  if (timingSafeEqual(given, API_TOKEN)) return next();
+  res.set("WWW-Authenticate", "Bearer");
+  return res.status(401).json({
+    ok: false, block: true, kind: "unauthorized", allowed: false,
+    reason: "Missing or invalid API token.",
+  });
+}
 
 // Early backpressure: reject a full queue BEFORE the body is parsed/spooled, so a
 // flood of large uploads costs almost nothing instead of exhausting memory/disk.
@@ -343,20 +429,45 @@ function queueGate(_req, res, next) {
   next();
 }
 
-// Health: is Ollama reachable?
-app.get("/api/health", async (_req, res) => {
+// Is Ollama reachable AND are the configured models actually pulled? The initial
+// `ollama pull` takes minutes, so "ready" flips true only once it's finished.
+async function readiness() {
+  const r = await fetchTimeout(OLLAMA_URL + "/api/tags", {}, "health");
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const data = await r.json();
+  const installed = (data.models || []).map((m) => m.name);
+  const need = [DEFAULTS.describer, DEFAULTS.decision];
+  // Unconfigured counts as NOT ready — otherwise the container reports healthy
+  // and then fails every single classify call.
+  const missing = need.map((n) => n || "(unset)").filter((n) => !installed.includes(n));
+  return { installed, missing, ready: missing.length === 0 };
+}
+
+// Rich status (always 200 if Ollama answers).
+app.get("/api/health", requireToken, async (_req, res) => {
   try {
-    const r = await fetchTimeout(OLLAMA_URL + "/api/tags", {}, "health");
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const data = await r.json();
-    res.json({ ok: true, ollama: true, models: (data.models || []).length, queue: queueStats() });
+    const { installed, missing, ready } = await readiness();
+    res.json({ ok: true, ollama: true, ready, models: installed.length, missingModels: missing, queue: queueStats() });
   } catch (err) {
-    res.status(502).json({ ok: false, ollama: false, error: String(err.message || err), queue: queueStats() });
+    res.status(502).json({ ok: false, ollama: false, ready: false, error: String(err.message || err), queue: queueStats() });
+  }
+});
+
+// Lightweight readiness probe: 200 only once the configured models are pulled.
+// The Docker HEALTHCHECK uses this, so container "healthy" == download finished
+// and ready to classify. Also a valid k8s readiness probe.
+app.get("/healthz", async (_req, res) => {
+  try {
+    const { ready, missing } = await readiness();
+    if (ready) return res.status(200).json({ ready: true });
+    return res.status(503).json({ ready: false, missingModels: missing });
+  } catch (err) {
+    return res.status(503).json({ ready: false, error: String(err.message || err) });
   }
 });
 
 // Models list for the UI dropdowns (with a vision flag).
-app.get("/api/models", async (_req, res) => {
+app.get("/api/models", requireToken, async (_req, res) => {
   try {
     const r = await fetchTimeout(OLLAMA_URL + "/api/tags", {}, "tags");
     if (!r.ok) throw new Error("HTTP " + r.status);
@@ -374,7 +485,7 @@ app.get("/api/models", async (_req, res) => {
 });
 
 // Current defaults + prompts (so the UI can populate its Settings tab).
-app.get("/api/config", (_req, res) => {
+app.get("/api/config", requireToken, (_req, res) => {
   res.json({
     defaults: {
       describer: DEFAULTS.describer,
@@ -382,6 +493,8 @@ app.get("/api/config", (_req, res) => {
       threshold: DEFAULTS.threshold,
       temperature: DEFAULTS.temperature,
     },
+    // Tells the UI whether its model/prompt controls actually do anything.
+    overridesAllowed: ALLOW_OVERRIDES,
     prompts: currentPrompts(),
   });
 });
@@ -390,14 +503,15 @@ app.get("/api/config", (_req, res) => {
 //   * multipart/form-data with a file field named "image"  (curl -F image=@pic.jpg)
 //   * application/json with { "image_base64": "..." } or { "image": "data:...;base64,..." }
 // Optional overrides (form fields or JSON): describer, decision, threshold,
-// temperature, describerPrompt, decisionPrompt.
-app.post("/classify", queueGate, upload.single("image"), jsonBody, async (req, res) => {
+// temperature, describerPrompt, decisionPrompt — ONLY honoured when
+// ALLOW_OVERRIDES is on, since they can otherwise disable the gate entirely.
+app.post("/classify", requireToken, queueGate, upload.single("image"), jsonBody, async (req, res) => {
   const tmpPath = req.file ? req.file.path : null;
   try {
     const body = req.body || {};
     // Multipart upload → a disk path; JSON base64 → an in-memory buffer.
     let input = tmpPath;
-    if (!input) input = decodeImageField(body.image_base64 || body.image || body.image_url);
+    if (!input) input = decodeImageField(body.image_base64 || body.image);
     if (!input) {
       return res.status(400).json({
         ok: false, block: true, kind: "error", allowed: false,
@@ -405,20 +519,28 @@ app.post("/classify", queueGate, upload.single("image"), jsonBody, async (req, r
       });
     }
 
-    const opts = {
-      describer: body.describer || undefined,
-      decision: body.decision || undefined,
-      threshold: body.threshold != null ? Number(body.threshold) : undefined,
-      temperature: body.temperature != null ? Number(body.temperature) : undefined,
-      describerPrompt: body.describerPrompt || undefined,
-      decisionPrompt: body.decisionPrompt || undefined,
-    };
+    const opts = ALLOW_OVERRIDES
+      ? {
+          describer: normTag(body.describer) || undefined,
+          decision: normTag(body.decision) || undefined,
+          threshold: body.threshold != null ? Number(body.threshold) : undefined,
+          temperature: body.temperature != null ? Number(body.temperature) : undefined,
+          describerPrompt: body.describerPrompt || undefined,
+          decisionPrompt: body.decisionPrompt || undefined,
+        }
+      : {};
 
     let result;
     try {
-      // Queued so concurrent uploads don't thrash the CPU.
-      result = await enqueue(() => classifyImage(input, opts));
+      // Queued so concurrent uploads don't thrash the CPU. If the caller hangs up
+      // while still waiting, give the slot back instead of burning CPU on it.
+      const ticket = enqueue(() => classifyImage(input, opts));
+      res.on("close", () => {
+        if (!res.writableEnded) ticket.cancel(Object.assign(new Error("client disconnected"), { code: "ABORTED" }));
+      });
+      result = await ticket.promise;
     } catch (err) {
+      if (err && err.code === "ABORTED") return; // nobody left to answer
       if (err && err.code === "BUSY") {
         res.set("Retry-After", "5");
         return res.status(503).json({
@@ -442,8 +564,8 @@ app.post("/classify", queueGate, upload.single("image"), jsonBody, async (req, r
   }
 });
 
-// Static demo UI (index.html / styles.css / app.js).
-app.use(express.static(PUBLIC_DIR));
+// Static demo UI (index.html / styles.css / app.js). Off with SERVE_UI=false.
+if (SERVE_UI) app.use(express.static(PUBLIC_DIR));
 
 // Fail-closed error handler (e.g. upload too large, malformed body).
 // eslint-disable-next-line no-unused-vars
@@ -455,8 +577,20 @@ app.use((err, _req, res, _next) => {
   });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[bouncer] listening on :${PORT}`);
   console.log(`[bouncer] ollama = ${OLLAMA_URL}`);
   console.log(`[bouncer] describer=${DEFAULTS.describer || "(unset)"}  decision=${DEFAULTS.decision || "(unset)"}`);
+  console.log(`[bouncer] auth=${API_TOKEN ? "token" : "OPEN"}  overrides=${ALLOW_OVERRIDES}  ui=${SERVE_UI}`);
+  if (!API_TOKEN) console.warn("[bouncer] WARNING: API_TOKEN is unset — anyone who can reach this port can classify.");
+  if (ALLOW_OVERRIDES) console.warn("[bouncer] WARNING: ALLOW_OVERRIDES=true — callers may override models and prompts.");
 });
+
+// Stop accepting connections on SIGTERM so `docker stop` is graceful.
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    console.log(`[bouncer] ${sig} — shutting down`);
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 10000).unref();
+  });
+}
